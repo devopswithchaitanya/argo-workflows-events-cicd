@@ -1,0 +1,97 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: ci-cd-pipeline
+  namespace: argo
+spec:
+  entrypoint: pipeline
+  arguments:
+    parameters:
+      - name: repo-url
+        value: "https://github.com/devopswithchaitanya/myapp"
+      - name: commit-sha
+        value: "HEAD"
+  volumeClaimTemplates:
+    - metadata:
+        name: workspace
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi
+
+  templates:
+    - name: pipeline
+      dag:
+        tasks:
+          - name: checkout
+            template: git-checkout
+          - name: test
+            template: run-tests
+            dependencies: [checkout]
+          - name: build
+            template: docker-build
+            dependencies: [test]
+          - name: push
+            template: docker-push
+            dependencies: [build]
+          - name: deploy
+            template: k8s-deploy
+            dependencies: [push]
+
+    - name: git-checkout
+      container:
+        image: alpine/git:latest
+        command: [sh, -c]
+        args:
+          - git clone {{inputs.parameters.repo-url}} /workspace/app &&
+            cd /workspace/app &&
+            git checkout {{inputs.parameters.commit-sha}}
+        volumeMounts:
+          - name: workspace
+            mountPath: /workspace
+
+    - name: run-tests
+      container:
+        image: node:18-alpine
+        command: [sh, -c]
+        args:
+          - cd /workspace/app && npm install && npm test
+        volumeMounts:
+          - name: workspace
+            mountPath: /workspace
+
+    - name: docker-build
+      container:
+        image: docker:24-dind
+        command: [sh, -c]
+        args:
+          - docker build -t myapp:{{inputs.parameters.commit-sha}} /workspace/app
+        volumeMounts:
+          - name: workspace
+            mountPath: /workspace
+
+    - name: docker-push
+      container:
+        image: amazon/aws-cli:latest
+        command: [sh, -c]
+        args:
+          - |
+            aws ecr get-login-password --region eu-central-1 | docker login --username AWS --password-stdin $ECR_REGISTRY
+            docker tag myapp:{{inputs.parameters.commit-sha}} $ECR_REGISTRY/myapp:{{inputs.parameters.commit-sha}}
+            docker push $ECR_REGISTRY/myapp:{{inputs.parameters.commit-sha}}
+        env:
+          - name: ECR_REGISTRY
+            valueFrom:
+              secretKeyRef:
+                name: aws-ecr-secret
+                key: registry
+
+    - name: k8s-deploy
+      container:
+        image: bitnami/kubectl:latest
+        command: [sh, -c]
+        args:
+          - |
+            kubectl set image deployment/myapp myapp=$ECR_REGISTRY/myapp:{{inputs.parameters.commit-sha}} -n production
+            kubectl rollout status deployment/myapp -n production
